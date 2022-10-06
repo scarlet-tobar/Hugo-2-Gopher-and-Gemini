@@ -83,5 +83,10 @@ In addition, this script can add the correct host and port to a gophermap. There
 ## License
 GPLv3
 
+# Extra notes
+Use textChar: false if you are going to use fixup.sh, or you'll get doble "i" in your gophermap.
+
+Help from the scripts: add -h when executing.
+
 
  
