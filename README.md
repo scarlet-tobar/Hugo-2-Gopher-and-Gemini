@@ -84,9 +84,13 @@ In addition, this script can add the correct host and port to a gophermap. There
 GPLv3
 
 # Extra notes
-Use textChar: false if you are going to use fixup.sh, or you'll get doble "i" in your gophermap.
+* Use textChar: false if you are going to use fixup.sh, or you'll get doble "i" in your gophermap.
 
-Help from the scripts: add -h when executing.
+* Help from the scripts: add -h when executing.
+
+* Copy the contents from layouts to layouts-gg, so it transforms the files.
+
+* Rebase with hugo2gg.py doesn't work (yet?), use fixup.sh
 
 
  
