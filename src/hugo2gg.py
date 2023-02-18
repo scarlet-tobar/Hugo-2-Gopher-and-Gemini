@@ -26,6 +26,8 @@ import os
 import re
 import io
 import sys
+import html
+import shutil
 import getopt
 import random
 import urllib
@@ -35,9 +37,14 @@ import datetime
 import mimetypes
 import subprocess
 
+## Global variables
 verbose = False
 keepTmpFiles = False
+fullGopherLine = False
 gopherLineLength = 70
+maxEmptyLines = 1
+mapLinkLabels = {}
+mapReplace = {}
 
 def vbprint(*args, **kwargs):
     if verbose:
@@ -146,7 +153,7 @@ class Markdown_reader:
         if this.isGopher and this.line and (this.line[0] == 'i') and (this.nextline[0] == 'i'):
             line1 = this.line[1:]
             line2 = this.nextline[1:]
-        elif this.isGopher:
+        elif this.isGopher: ## This is a non-text gopher line (meaning a link line) and shoul not be merged
             return False
         else:
             line1 = this.line
@@ -155,6 +162,8 @@ class Markdown_reader:
                 good_first(line1) and good_second(line2))
 
     def get_line(this, isFenced):
+        # isFenced means that it inside a code block that start with three back tildes (``` code ```)
+        # and so it should be considered literal
         if not this.isValid:
             return ''
         try:
@@ -188,7 +197,21 @@ class Markdown_reader:
                     break
             if (not isFenced) and this.re_break2.search(this.line):  ## Line break
                 this.line = this.line.replace('<br>','')
-            return this.line + this.rest
+
+            # Ready to return a line, but need to clean it up first if it is not fenced
+            # Note that lines starting with four blanks or a tab are considered fenced
+            rLine = this.line + this.rest
+            if not isFenced:
+                if len(rLine) > 4:
+                    if (rLine[0:4] == '    ') or (rLine[0:1] == '\t'):
+                        isFenced = True
+                    elif this.isGopher and ((rLine[0:5] == 'i    ') or (rLine[0:2] == 'i\t')):
+                        isFenced = True
+
+            if isFenced:
+                return rLine
+            else:
+                return html.unescape(rLine)
         except OSError as e:
             error(e, " while reading file", src)
 
@@ -265,15 +288,46 @@ def clone_file(src, dst):
         if not os.path.exists(dstFolder):
             os.makedirs(dstFolder)
 
-        with open(src, 'rb') as flSrc:
-            with open(dst, 'wb') as flDst:
-                flDst.write(flSrc.read(4096))
+        shutil.copyfile(src, dst)
 
     except OSError as e:
         error(e, " while processing files", src,"=>",dst)
 
 
 def extract_arg(line):
+    # Extract the arguments from the first line of the file.
+    # This first line corresponds to the front matter of the original markdown in Hugo.
+    # These arguments include:outputs, ggKeepRaw, ggRemoveExtras, ggCopyPage, and ggIgnoreLinks
+    # 
+    #outputs: ["html", "rss", "gemini", "gopher"]
+    # Outputs is used to limit the generation of this page
+    # for example, if you want a page to be generated for gopher only
+    # you will use: 'outputs: ["gopher"]'
+    #
+    #ggKeepRaw: false
+    # Keep raw will just keep the raw page as it was writen. In other words,
+    # no convertion process will be done in the page. Useful if the page was
+    # writen specifically for Gopher or for Gemini and you use the corresponding 
+    # outputs (above)
+    #
+    #ggRemoveExtras: false
+    # Remove extras will not generate extras for this page. Extras are controlled
+    # in the config.gg.toml under [params.gopher] and [params.gemini]. Their names
+    # start with 'include'. They are Menu, Categories, Social, Return home, and
+    # Author. This is useful if you wants a specific page to be different.
+    #
+    #ggCopyPage: false
+    # Copy page will force hugo2gg.py to copy this page from the 'last' directory.
+    # This uses the 'hugo2gg.py --last' option (default to public-gg-sav).
+    # Useful when you manually modify a generated page and want to keep your
+    # changes. In that case you will copy your modified site to a directory, and
+    # execute hugo2gg.py with the correct --last option.
+    #
+    #ggIgnoreLinks: false
+    # Ignore links will ignore the links in the page. Links will not be generated
+    # for that page. Useful for pages where the links are not that important, and 
+    # you don't want to include them in Gopher or Gemini.
+
     arg = {}
     line = line.rstrip('\r\n')
     if line and (line[0:6] == '[[[=> ') and (line[-5:] == '<=]]]'):
@@ -283,10 +337,66 @@ def extract_arg(line):
     pairs = line.split(',')
     for pair in pairs:
         single = pair.split(':')
-        vbprint("Page arg:", single)
         if len(single) == 2:
             arg[single[0]] = True if single[1] == 'true' else False if single[1] == 'false' else single[1]
+    vbprint("Page args:",arg)
     return arg
+
+
+def replace_mapped_text(line):
+    # will try to replace all text specified in the mapping file
+    if not mapReplace:
+        return line
+    for key, label in mapReplace.items():
+        line = line.replace(key,label)
+    return line
+
+def clean_html_tags(line):
+    # Process html tags and either remove them or convert them to links
+    def process_html_tags(line,tags):
+        if len(tags) == 2:
+            all = line[line.find(tags[0]) : line.find(tags[1])+len(tags[1])]
+            txt = line[line.find(tags[0])+len(tags[0]):line.find(tags[1])]
+            if tags[1] == "</a>":
+                link = re.search(r'".*?"',tags[0]).group()
+                if link:
+                    txt = '[' + txt + '](' + link[1:-1] + ')' 
+            return line.replace(all,txt)
+        indexes = []
+        last_tag = ""
+        last_name = "."
+        last_index = -1
+        for i,t in enumerate(tags):
+            n = re.search(r'\/?\w+',t).group()
+            if n[0] == '/' and last_name == n[1:]:
+                nLine = process_html_tags(line,[last_tag,t])
+                return  process_html_tags(nLine,tags[:last_index] + tags[i+1:])
+            last_tag = t
+            last_name = n
+            last_index = i
+        # Note that are cases when not all the tags are in a line, and they are skip
+        # in other words if the number of tags are odd then we will only process the pairs in the line
+        return line
+
+    tags = re.findall(r'<\/\w*>|<.+?>',line) # Find all the html tags in the line
+    if tags:
+        return process_html_tags(line,tags)
+    return line
+
+
+def clean_hugo_shortcuts(line):
+    # Hugo is not able to process shorcuts for text output (which is unfortunate)
+    # So, we need to do thius hack in here
+    scs = re.findall(r'{{% .*? %}}|{{< .*? >}}',line)
+    for s in scs:
+        pieces = s.split()
+        if (len(pieces) > 3):
+            shortcut = pieces[1].lower()
+            if shortcut == "youtube":
+                line = line.replace(s, '[' + mapLinkLabels.get(pieces[2],'youtube ' + pieces[2]) + '](https://www.youtube.com/watch?v=' + pieces[2] + ')')
+            elif shortcut == "instagram":
+                line = line.replace(s,'[' + mapLinkLabels.get(pieces[2],'instagram ' + pieces[2]) + '](https://www.instagram.com/p/' + pieces[2] + '/)')
+    return line
 
 
 def clean_markdown(line, add_LF = False):
@@ -304,25 +414,72 @@ def clean_markdown(line, add_LF = False):
         while (new[0] == '_') and (new[-1] == '_'):
             new = new[1:-1]
         line = line.replace(item, new)
-    # strip code enclosed in one backticks (`)
-    emphasis = re.findall(r"[^`]`[^`]+`[^`]",line)
-    for item in emphasis:
-        line = line.replace(item, item[1:-1])
-    # strip code enclosed in two backticks (``)
-    emphasis = re.findall(r"``.+``",line) # Will not work in all cases
+    # strip code enclosed in three backticks (```)
+    emphasis = re.findall(r"(?<!`)```.*?```",line)
     for item in emphasis:
         line = line.replace(item, item[2:-2])
+    # strip code enclosed in two backticks (``)
+    emphasis = re.findall(r"(?<!`)``.*?``",line)
+    for item in emphasis:
+        line = line.replace(item, item[2:-2])
+    # strip code enclosed in one backticks (`)
+    emphasis = re.findall(r"(?<!`)`[^`]+`",line)
+    for item in emphasis:
+        line = line.replace(item, item[1:-1])
     if add_LF:
-        line = line.strip('\r\n ') + '\n'
+        line = line.rstrip('\r\n ') + '\n'
     return line
 
+
+##  links in Hugo (extract_links & one_line_link)##
+## 
+## Common format is: [label](uri)
+##     Note that uri can have a title, and becomes [label](uri "title")
+##       in this case the title is in quotes and separated by a space, and it is ignored in the output
+##       Note that uri should not have blanks (they should have %20 instead)
+##       For example:
+##                  [my link](http://www.example.com)
+##                  [my link](http://www.example.com "a title for my link")
+##
+## Other options are:
+##
+## - email is <email> 
+##       For example: <fake@mail.com>
+##
+## - URL is <url> 
+##       For example: <http://www.example.com>
+##
+## - HTML tag <a href="uri">label</a>
+##       For example: <a href="http://www.examp[le.com">my example</a>
+##
+## - Hugo shortcodes (https://gohugo.io/content-management/shortcodes/)
+##   Delimited by {{%  %}}  or by {{<  >}}
+##   Not all the shortcuts are supported. The supported subset is as follows:
+##       - instagram
+##         For example: {{< instagram BWNjjyYFxVx >}} 
+##             becomes https://www.instagram.com/p/BWNjjyYFxVx/
+##
+##       - tweet
+##         For example: {{< tweet user="SanDiegoZoo" id="1453110110599868418" >}}
+##             becomes https://twitter.com/SanDiegoZoo/status/1453110110599868418
+##
+##       - youtube
+##         For example: {{< youtube w7Ft2ymGmfc >}}
+##             becomes https://www.youtube.com/watch?v=w7Ft2ymGmfc
+##
+######### CHECK http://www.rexegg.com/regex-uses.html
 
 def extract_links(line, pageLinks, ignoreLinks = False):
     lineLinks = re.findall(r'!?\[[^\]]*\]\([^\)]*\)|<[^<]+[@:][^<]+>',line)
     for link in lineLinks:
+        original_link = link
         if link[0] == '<' and link[-1] == '>':
-            link = '[' + link[1:-1] + '](' + link[1:-1] + ')'
+            lk = link[1:-1]
+            if re.search(r'^[a-zA-Z][.\w-]*@[.\w-]+$',lk):
+                lk = 'mailto:' + lk
+            link = '[' + mapLinkLabels.get(link[1:-1],link[1:-1]) + '](' + lk + ')'
         link = re.sub(r'\s+"[^"]+"\s*\)',')',link)
+        #link = re.sub(r'%25','%',link)
         if not (link in pageLinks):
             pageLinks[link] = len(pageLinks) + 1
         ref = link.split('](')
@@ -333,16 +490,18 @@ def extract_links(line, pageLinks, ignoreLinks = False):
             cite = ref[0][2:] + (citeId if not ignoreLinks else "")
         else:
             cite = ref[0][1:] + (citeId if not ignoreLinks else "")
-        line = line.replace(link,cite)
+        line = line.replace(original_link,cite)
     return line, (pageLinks if not ignoreLinks else {})
 
 
 def one_line_link(line):
     single = {}
-    if re.search(r'^i?\s*!?\[[^\]]*\]\([^\)]*\)\s*$|^i?\s*<[^<]+[@:][^<]+>\s*$',line):
+    ##if re.search(r'^i?\s*!?\[[^\]]*\]\([^\)]*\)\s*$|^i?\s*<[^<]+[@:][^<]+>\s*$',line):
+    if re.search(r'^\s*!?\[[^\]]*\]\([^\)]*\)\s*$|^i?\s*<[^<]+[@:][^<]+>\s*$',line):
         single['hint'] = 'I' if re.search(r'^i?\s*!\[',line) else 'h'
         link = line[1:].strip(' <![)>\t') if line[0] == 'i' else line.strip(' <![)>\t')
         link = re.sub(r'\s+"[^"]+"\s*\)',')',link)
+        #link = re.sub(r'%25','%',link)
         ref = link.split('](')
         single['uri'] = ref[0]
         single['label'] = ref[0]
@@ -395,7 +554,7 @@ def convert_gopher(src, dst, arPath, arLast, arBase):
         text += words[-1]
         return text
 
-    def gopher_text(txt, prefix):
+    def gopher_text(txt, prefix = ''):
         lines = []
 
         # Process headings
@@ -484,10 +643,12 @@ def convert_gopher(src, dst, arPath, arLast, arBase):
     # 2- lines must end with <CR><LF> (meaning '\r\n')
     vbprint("CONVERT Gophermap:",src,"->",dst)
     replacePage = False
+    addItemForText = False
     try:
         count = 0
         countOtherLinks = 0
-        isFenced = False
+        isFenced = False # Fencing means that it inside a clode block that start with three back tildes (``` code ```)
+        skipLine =False
         pageLinks = {}
         lineEnd = '\r\n'
         arg = {}
@@ -498,10 +659,9 @@ def convert_gopher(src, dst, arPath, arLast, arBase):
 
         def print_references(prefix):
             if len(pageLinks) == 0:
-                if countOtherLinks  == 0:
-                    warn("No links in '",src,"' convert to '",dst,
-                            "', it should be a txt file (instead of a gophermap)")
                 return
+            nonlocal countOtherLinks
+            countOtherLinks  += 1
             if prefix == 'i':
                 flDst.write(prefix + '\t' + filler + lineEnd + prefix + 
                         'References:\t' + filler + lineEnd)
@@ -510,7 +670,7 @@ def convert_gopher(src, dst, arPath, arLast, arBase):
             for key, value in sorted(pageLinks.items(), key=lambda item: item[1]):
                 ref = key.split('](')
                 hint = 'I' if ref[0][0] == '!' else 'h'
-                label = ref[0][2:] if ref[0][0] == '!' else ref[0][1:]
+                label = clean_markdown(ref[0][2:] if ref[0][0] == '!' else ref[0][1:])
                 uri = ref[1][:-1]
                 lineItem = item_type(uri, hint)
                 if lineItem == 'h':
@@ -518,26 +678,62 @@ def convert_gopher(src, dst, arPath, arLast, arBase):
                 flDst.write(lineItem + '  [' + str(value) + '] ' + label + '\t'
                         + (arBase if uri[0] == '/' else '') + uri + filler + lineEnd)
 
+
+        def break_gopher_line(line):
+            #line is: <item><text>[<TAB><selector>[<TAB><host>[<TAB><port>]]]<CR><LF>
+            parts = line.split('\t')
+            n = len(parts)
+            port = '' if n < 4 else parts[3]
+            host = '' if n < 3 else parts[2]
+            sele = '' if n < 2 else parts[1]
+            text = '' if n == 0 else parts[0]
+            item = ''
+            if len(text) > 0:
+                item = text[0]
+                text = text[1:]
+            return item, text, sele, host, port
+
+        def g_line(item, text, sele, host, port):
+            if not addItemForText and item == 'i':
+                line =  text
+            else:
+                line = item + text
+            if item == 'h' and not sele.startswith("URL:"):
+                sele = 'URL:' + sele
+            line += '' if not sele and not host and not port else '\t' + sele
+            line += '' if              not host and not port else '\t' + host
+            line += '' if                           not port else '\t' + port
+            return line + lineEnd
+
         while True:
             line = flSrc.get_line(isFenced)
-            if not line:
+            if not line: ## Note that empty lines comming from the file have at least a '\n' on them
                 break
+            if len(line) > 6 and line.startswith("i+++") and line.strip('\r\n').endswith("+++"):
+                continue #### This is a kludge to avoid debugging get_line()
             if (count == 0) and not arg:
-                arg = extract_arg(line)
+                arg = extract_arg(line) # Extract the arguments from the first line of the file.
+                if (fullGopherLine  or (arg and (arg['textChar'] or arg['fullLine']))):
+                    addItemForText = True
+                if arg and arg['copyPage']:
+                    replacePage = True
+                    break
                 if arg or (len(line.strip('\r\n\t ')) == 0):
                     continue
             count += 1
-            if arg and arg['copyPage']:
-                replacePage = True
-                break
             if arg and arg['keepRaw']:
                 flDst.write(line)
                 continue
             line = line.rstrip('\r\n') # remove trailing <CR> and/or <LF>
+            if line == 'i---' or line == 'i+++':
+                skipLine = not skipLine 
+                continue
+            if skipLine:
+                continue
             if re.search(r"^i?\s*```",line): #toggle fenced code
                 isFenced  = not isFenced
                 continue
-            if isFenced:
+            if isFenced or ((len(line) > 4) and ((line[0:5] == 'i    ') or (line[0:2] == 'i\t'))):
                 linePart = line.split('\t')
                 if len(linePart[0]) > gopherLineLength:
                     warn("Fenced line too long (exceed ",gopherLineLength," chars by ",
@@ -550,74 +746,110 @@ def convert_gopher(src, dst, arPath, arLast, arBase):
                 continue
             if not line:
                 continue
+            if line.strip() == '[[[=> references <=]]]':
+                print_references('i' if addItemForText else '')
+                continue
+
             # Strict gopher: lines are composed of five parts:
             # item: one character describing the item type
+            #    it is one of the following: (see 'https://en.wikipedia.org/wiki/Gopher_(protocol)')
+            #    Canonical types
+            #    "0"  Text file
+            #    "1"  Gopher directory (may contain a gophermap)
+            #    "2"  CCSO Nameserver
+            #    "3"  Error code returned by a Gopher server to indicate failure
+            #    "4"  BinHex-encoded file (primarily for Macintosh computers)
+            #    "5"  DOS file
+            #    "6"  uuencoded file
+            #    "7"  Gopher full-text search
+            #    "8"  Telnet
+            #    "9"  Binary file
+            #    "+"  Mirror or alternate server (for load balancing or in case of primary server downtime)
+            #    "g"  GIF file
+            #    "I"  Image file
+            #    "T"  Telnet 3270
+            #    Gopher+ types
+            #    ":"  Bitmap image
+            #    ";"  Movie file
+            #    "<"  Sound file
+            #    Non-canonical types
+            #    "d"  Doc. Seen used alongside PDF's and .DOC's
+            #    "h"  HTML file
+            #    "i"  Informational message, widely used. Just plain text to display
+            #    "p"  image file "(especially the png format)"
+            #    "r"  document rtf file "rich text Format")
+            #    "s"  Sound file (especially the WAV format)
+            #    "P"  document pdf file "Portable Document Format")
+            #    "X"  document xml file "eXtensive Markup Language")
             # text: user visible string or label
             # selector: often a path, uri or other file selector
-            # domain: the domain name of the host containing the selector
-            # port: the port used by the domain
+            # host: the domain name of the host containing the selector
+            # port: the port used by the host
             #
-            #line is: <item><text>[<TAB><selector>[<TAB><domain>[<TAB><port>]]]<CR><LF>
+            #line is: <item><text>[<TAB><selector>[<TAB><host>[<TAB><port>]]]<CR><LF>
             #
-            line = line.replace('gophermap.txt','gophermap')
-            linePart = line.split('\t')
-            nLineParts = len(linePart)
-            if nLineParts == 4:
-                filler = ""
-            elif (nLineParts <= 2) and arg and arg['fullLine']:
-                filler = '\t' + arg['host'] + '\t' + arg['port']
-            elif nLineParts > 4:
-                error(" Extra tabs in '",src,"', line ",flSrc.get_count(),":",linePart);
+            item, text, selector, host, port = break_gopher_line(line.replace('gophermap.txt','gophermap'))
 
-            if line.strip() == '[[[=> references <=]]]':
-                print_references('i' if arg and (arg['textChar'] or arg['fullLine']) else '')
-                continue
+            if item == '1' and not selector:
+                selector = '/'  ## Force it to the begining the alternative is to ignore the line
+
+            if item in ['0','1','4','5','6','9','g','I','h','s']:
+                countOtherLinks += 1
+
+            if fullGopherLine or (arg and arg['fullLine']):
+                if not host:
+                    host = arg['host']
+                if not port:
+                    port = arg['port']
+                if item == 'i':
+                    selector = '/'
+                    host = ''
+                    port = ''
+
+            # need to  clean up stuff
+            if item == '1' and re.search(r'^\s*\/gopher\/',selector):
+                selector = selector.replace("/gopher/","/")
+
+            text = replace_mapped_text(text)
+            text = clean_html_tags(text)
+            text = clean_hugo_shortcuts(text)
 
             # need to extract and replace links [text](link)
             # Links alone in a single line shoul be placed in the same line
-            single = one_line_link(line)
-            if single:
-                if arg and arg['ignoreLinks']:
-                    flDst.write(single['label'] + lineEnd)
-                else:
-                    flDst.write(item_type(single['uri'], single['hint']) + '  ' + 
-                            single['label'] + '\t' + single['uri'] + filler + lineEnd)
-                continue
-
-            # Links embeded in the text of the line must be collected for late placement
-            linePart[0], pageLinks = extract_links(linePart[0], pageLinks, arg and arg['ignoreLinks'])
-
-            linePart[0] = clean_markdown(linePart[0])
-            if linePart[0][0] in ['0','1','4','5','6','9','g','I','h','s']:
-                countOtherLinks += 1
-            if linePart[0][0] == 'i': ### Text line
-                lines = gopher_text(linePart[0][1:], 
-                        'i' if arg and (arg['textChar'] or arg['fullLine']) else '')
-                for l in lines:
-                    if nLineParts > 3:
-                        lne = l + '\t' + linePart[1] + '\t' + linePart[2] + '\t' + linePart[3]
-                    elif nLineParts > 2:
-                        lne = l + '\t' + linePart[1] + '\t' + linePart[2]
-                    elif nLineParts > 1:
-                        lne = l + '\t' + linePart[1]
+            if item == 'i':
+                single = one_line_link(text)
+                if single:
+                    if arg and arg['ignoreLinks']:
+                        flDst.write(g_line(item, single['label'], '', host, port))
+                        #flDst.write(single['label'] + lineEnd)
                     else:
-                        lne = l
-                    flDst.write(lne + filler + lineEnd)
-                continue
-            elif (nLineParts > 1) and linePart[0][0] == '1': ### Directory line
-                if linePart[1].rstrip().endswith('gophermap'):
-                    linePart[1] = linePart[1].strip()[:-9].rstrip(os.sep)
-                    if nLineParts > 3:
-                        lne = linePart[0] + '\t' + linePart[1] + '\t' + linePart[2] + '\t' + linePart[3]
-                    elif nLineParts > 2:
-                        lne = linePart[0] + '\t' + linePart[1] + '\t' + linePart[2]
-                    else:
-                        lne = linePart[0]+ '\t' + linePart[1]
-                    flDst.write(lne + filler + lineEnd)
+                        flDst.write(g_line(item_type(single['uri'], single['hint']), single['label'], single['uri'], host, port))
+                        #flDst.write(item_type(single['uri'], single['hint']) + '  ' + single['label'] + '\t' + single['uri'] + filler + lineEnd)
                     continue
 
-            flDst.write(line + filler + lineEnd)
+                # Links embeded in the text of the line must be collected for late placement
+                text, pageLinks = extract_links(text, pageLinks, arg and arg['ignoreLinks'])
 
+            text = clean_markdown(text)
+            if item == 'i': ### Text line
+                lines = gopher_text(text) 
+                for l in lines:
+                    flDst.write(g_line(item, l, selector, host, port))
+                    #flDst.write(lne + filler + lineEnd)
+                continue
+            elif item == '1': ### Directory line
+                if selector.rstrip().endswith('gophermap'):
+                    selector = selector.strip()[:-9].rstrip(os.sep)
+                    flDst.write(g_line(item, text, selector, host, port))
+                    #flDst.write(lne + filler + lineEnd)
+                    continue
+
+            flDst.write(g_line(item, text, selector, host, port))
+            #flDst.write(line + filler + lineEnd)
+
+        if countOtherLinks  == 0:
+            warn("No links in '",src,"' convert to '",dst,
+                        "', it should be a txt file (instead of a gophermap)")
         flSrc.destroy()
         flDst.close()
         delete_file(src)
@@ -635,7 +867,9 @@ def convert_gemini(src, dst, arPath, arLast, arBase):
     replacePage = False
     try:
         count = 0
+        emptyLines = 0
         isFenced = False
+        skipLine =False
         pageLinks = {}
         arg = {}
 
@@ -645,49 +879,81 @@ def convert_gemini(src, dst, arPath, arLast, arBase):
             flDst.write('\nReferences:\n')
             for key, value in sorted(pageLinks.items(), key=lambda item: item[1]):
                 ref = key.split('](')
+                label = clean_markdown(ref[0][1:])
                 if ref[0][0] == '!':
                     flDst.write('=> ' + (arBase if ref[1][0] == '/' else '')
                             + urllib.parse.quote(ref[1][:-1],':/?=+&') 
-                            + '  [' + str(value) + '] ' + ref[0][2:] + '\n')
+                            + '  [' + str(value) + '] ' + label + '\n')
                 else:
                     flDst.write('=> ' + (arBase if ref[1][0] == '/' else '')
                             + urllib.parse.quote(ref[1][:-1],':/?=+&')
-                            + '  [' + str(value) + '] ' + ref[0][1:] + '\n')
-            flDst.write('\n')
+                            + '  [' + str(value) + '] ' + label + '\n')
+            #flDst.write('\n')
 
         flSrc = Markdown_reader(src, False)
         flDst = open(dst, 'wt')
 
         while True:
             line = flSrc.get_line(isFenced)
-            if not line:
+            if not line: ## Note that empty lines comming from the file have at least a '\n' on them
                 break
+            if len(line) > 6 and line.startswith("+++") and line.strip('\r\n').endswith("+++"):
+                continue #### This is a kludge to avoid debugging get_line()
             if (count == 0) and not arg:
                 arg = extract_arg(line)
+                if arg and arg['copyPage']:
+                    replacePage = True
+                    break
                 if arg or (len(line.strip('\r\n\t ')) == 0):
                     continue
             count += 1
 
             ## Note that gemini lines can end on <CR><LF> or just in <LF>
             ## so, we don't need to worry as much as with gopher
-            if arg and arg['copyPage']:
-                replacePage = True
-                break
             if arg and arg['keepRaw']:
                 flDst.write(line)
+                continue
+            if line.strip('\r\n') in ['---', '+++']:
+                skipLine = not skipLine 
+                continue
+            if skipLine:
                 continue
             if re.search(r"^\s*```",line): #toggle fenced code
                 flDst.write(line.strip('\t\r\n ') + '\n')
                 isFenced  = not isFenced
                 continue
-            if isFenced:
-                flDst.write(clean_markdown(line, True))
+            if isFenced or ((len(line) > 3) and ((line[0:4] == '    ') or (line[0:1] == '\t'))):
+                flDst.write(line.rstrip('\r\n ') + '\n')
                 continue
+
+            # need to  clean up stuff
+            #print(":LINE:[",line.rstrip('\r\n'),"]",sep='')
+            if line.rstrip('\r\n') == '':
+                emptyLines += 1
+                if emptyLines > maxEmptyLines:
+                    continue
+            else:
+                emptyLines = 0
+
+            if line[0:2] == '=>':
+                if re.search(r'=>\s*\/gemini\/',line):
+                    line = line.replace("/gemini/","/")
+                if re.search(r'\/gemini-page\.gmi\s+',line):
+                    line = line.replace("/gemini-page.gmi",".gmi")
+                line = line.replace("/.gmi",".gmi")
+                if line.find("=> .gmi") == 0:
+                    line = "BAD LINE[" + line + "]"
+
+            line = replace_mapped_text(line)
+            line = clean_html_tags(line)
+            line = clean_hugo_shortcuts(line)
+
             # need to extract and replace links [text]()
             # Links alone in a single line shoul be placed in the same line
             single = one_line_link(line.strip('\r\n'))
             if single:
                 #flDst.write('=> ' + single['uri'] + '   ' + single['label'] + '\n')
+                #print('OUT1:[=> ' + urllib.parse.quote(single['uri'],':/?=+&') + '   ' + single['label'] + ']',sep='')
                 flDst.write('=> ' + urllib.parse.quote(single['uri'],':/?=+&') 
                         + '   ' + single['label'] + '\n')
                 continue
@@ -699,7 +965,11 @@ def convert_gemini(src, dst, arPath, arLast, arBase):
                 print_references()
                 continue
 
-            flDst.write(clean_markdown(line, True))
+            if len(line) > 2 and line[0:2] == '=>':
+                flDst.write(line)
+            else:
+                #print("OUT2:[",clean_markdown(line, True),"]",sep='')
+                flDst.write(clean_markdown(line, True))
 
         flSrc.destroy()
         flDst.close()
@@ -735,7 +1005,7 @@ def traverse_gemini(arGemini, arPath, arLast, arBase):
                 if ext.lower() == ".gmi":
                     count += 1
                     base = os.path.basename(rootDir)
-                    if (base.lower() == "gemini") or not base:
+                    if ((base.lower() == "gemini") and (rootDir == arGemini)) or not base:
                         base = "index"
                     os.rename(sourceName, sourceName + "-old")
                     folder = os.path.dirname(rootDir)
@@ -903,24 +1173,28 @@ def execHugo(arNoHugo, arPath, arConfig, arEmpty):
 
 def arguments() :
     print("Usage:\n ",os.path.basename(sys.argv[0])," [flags]\n\nFlags:")
-    print("   -p, --path    <path>  Path of the site to be converted (default to public-gg)")
-    print("   -g, --gopher  <path>  Gopher output folder (default to public-gg/gopher)")
-    print("   -G, --gemini  <path>  Gemini output folder (default to public-gg/gemini)")
-    print("   -e, --empty   <path>  Path of empty folder (default to layouts-gg)")
-    print("   -l, --last    <path>  Path for last build folder (default to public-gg-sav)")
-    print("   -b, --base    <path>  Rebase all Gopher absolute links to <path>")
-    print("   -B, --Base    <path>  Rebase all Gemini absolute links to <path>")
-    print("   -c, --config  <file>  Name of the hugo config file (default to config-gg.toml)")
-    print("   -t, --type    <type>  type of output to be generated (default to all)")
-    print("                         <type> can be:")
-    print("                                all      Generate both gopher and gemini sites")
-    print("                                gopher   Generate only the gopher hole")
-    print("                                gemini   Generate only the gemini capsule")
-    print("   -k, --keep            Keep processed temporary files for debugging purposes")
-    print("   -m, --max-line <num>  Max lenght of gophermap lines (default 70 but some prefer 67)")
-    print("   -n, --no-hugo         Do not run  hugo. Remember to run hugo before")
-    print("   -h, --help            Prints this help")
-    print("   -v, --verbose         Produces verbose stdout output")
+    print("   -p, --path    <path>    Path of the site to be converted (default to public-gg)")
+    print("   -g, --gopher  <path>    Gopher output folder (default to public-gg/gopher)")
+    print("   -G, --gemini  <path>    Gemini output folder (default to public-gg/gemini)")
+    print("   -e, --empty   <path>    Path of empty folder (default to layouts-gg)")
+    print("   -l, --last    <path>    Path for last build folder (default to public-gg-sav)")
+    print("   -b, --base    <path>    Rebase all Gopher absolute links to <path>")
+    print("   -B, --Base    <path>    Rebase all Gemini absolute links to <path>")
+    print("   -c, --config  <file>    Name of the hugo config file (default to config-gg.toml)")
+    print("   -M, --map     <file>    File with mapping of labels to links (default to hugo2gg.map)")
+    print("   -t, --type    <type>    type of output to be generated (default to none)")
+    print("                           <type> can be:")
+    print("                                  all      Generate both gopher and gemini sites")
+    print("                                  gopher   Generate only the gopher hole")
+    print("                                  gemini   Generate only the gemini capsule")
+    print("   -k, --keep              Keep processed temporary files for debugging purposes")
+    print("   -m, --max-line <num>    Max lenght of gophermap lines (default 70 but some prefer 67)")
+    print("   -f, --full-line         Forces each line in the gophermap to be fully compliant")
+    print("                           (overrides fullLine and textChar in config-gg.toml)")
+    print("   -n, --no-hugo           Do not run  hugo. Remember to run hugo before")
+    print("   -w, --white-lines <num> Indicate the max number of empty lines (default 1)")
+    print("   -h, --help              Prints this help")
+    print("   -v, --verbose           Produces verbose stdout output")
     sys.exit(2)
 
 
@@ -934,15 +1208,17 @@ def main(argv):
    arGemini   = "public-gg" + os.sep + "gemini"
    arLast     = "public-gg-sav"
    arEmpty    = "layouts-gg"
+   arMapFile  = "hugo2gg.map"
    arBaseGopher = arBaseGemini = ""
    typeGopher = False
    typeGemini = False
    arNoHugo   = False
-   arType     = "all"
+   arType     = "none"
 
    try:
-       opts, args = getopt.getopt(argv,"he:p:l:c:g:G:vt:knb:",
+       opts, args = getopt.getopt(argv,"hfe:p:l:c:g:G:vt:knb:w:M:",
                ["help","empty=","path=","last=","config=","gopher=",
+                   "full-line","white-lines=","map=",
                    "gemini=","verbose","type=","keep","no-hugo","base="])
    except getopt.GetoptError as e:
       error(e)
@@ -964,12 +1240,17 @@ def main(argv):
          arEmpty = arg
       elif opt in ("-c", "--config"):
          arConfig = arg
+      elif opt in ("-M", "--map"):
+         arMapFile = arg
       elif opt in ("-g", "--gopher"):
          arGopher = clean_dir(arg)
       elif opt in ("-G", "--gemini"):
          arGemini = clean_dir(arg)
       elif opt in ("-t", "--type"):
           arType = arg
+      elif opt in ("-w", "--white-lines"):
+          global maxEmptyLines 
+          maxEmptyLines = int(arg)
       elif opt in ("-v", "--verbose"):
           global verbose
           verbose = True
@@ -981,6 +1262,9 @@ def main(argv):
       elif opt in ("-k", "--keep"):
           global keepTmpFiles
           keepTmpFiles = True
+      elif opt in ("-f", "--full-line"):
+          global fullGopherLine
+          fullGopherLine = True
       elif opt == "": 
           error("Invalid argument")
           arguments()
@@ -1000,7 +1284,38 @@ def main(argv):
    if arType in ("all", "gemini"):
        print("    Gemini folder:",arGemini)
        typeGemini = True
-   print("    Config file:  ", arConfig, "\n    Last output:  ", arLast,"\n")
+   print("    Config file:  ", arConfig, "\n    Last output:  ", arLast)
+
+   if os.path.isfile(arMapFile):
+       print("    Map file:     ", arMapFile )
+       global mapLinkLabels
+       global mapReplace
+       with open(arMapFile) as map:
+           for line in map:
+               line = line.strip(' \t\n\r')
+               if not line or line[0] == '#':
+                   continue
+               key, sep, label = line.partition(":=")
+               key = key.strip()
+               if sep == ":=" and key:
+                   label = label.strip()
+                   if label and label[0] == '"' and label[-1] == '"':
+                       label = label[1:-1]
+                   if key and key[0] == '"' and key[-1] == '"':
+                       key = key[1:-1]
+                   vbprint("Replace:",key,"with",label)
+                   mapReplace[key] = label
+               if not sep:
+                   key, sep, label = line.partition("=")
+                   key = key.strip()
+                   if sep == "=" and key:
+                       label = label.strip()
+                       if label and label[0] == '"' and label[-1] == '"':
+                           label = label[1:-1]
+                       vbprint("Map:",key,"to",label)
+                       mapLinkLabels[key] = label
+
+   print("\n")
 
    execHugo(arNoHugo, arPath, arConfig, arEmpty)
    traverse_site(arPath, arGopher, typeGopher, arGemini, typeGemini)
