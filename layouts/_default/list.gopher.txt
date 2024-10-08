@@ -29,7 +29,9 @@ i{{- . }}
 i
 {{ range .Paginator.Pages }}
 {{- if .OutputFormats.Get "gopher" }}
+{{ if .File }}
 1{{ .Date.Format (.Site.Params.dateFormat | default "January 2, 2006" ) }} {{ .Title }}	/{{ replace .File.Path ".md" "" }}
+{{ end }}
 {{ end }}
 {{ end }}
 i
